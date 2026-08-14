@@ -9,62 +9,23 @@ from sqlalchemy import func
 import math
 
 app = Flask(__name__)
-
-# ═════════════════════════════════════════════
-# SECRET KEY — Persistent across restarts
-# ═════════════════════════════════════════════
-SECRET_KEY = os.environ.get('SECRET_KEY')
-if not SECRET_KEY:
-    _key_file = '.secret_key'
-    if os.path.exists(_key_file):
-        with open(_key_file, 'r') as f:
-            SECRET_KEY = f.read().strip()
-    else:
-        SECRET_KEY = os.urandom(32).hex()
-        try:
-            with open(_key_file, 'w') as f:
-                f.write(SECRET_KEY)
-        except Exception:
-            pass
-app.secret_key = SECRET_KEY
-
-# ═════════════════════════════════════════════
-# DATABASE — PostgreSQL on Render, SQLite locally
-# ═════════════════════════════════════════════
-DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///study_tracker.db')
-
-# SQLAlchemy 2.x compatibility
-if DATABASE_URL.startswith('postgres://'):
-    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
-
-app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///study_tracker.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-IS_POSTGRES = DATABASE_URL.startswith('postgresql://')
-
-# Connection pool settings for Postgres (critical for Render)
-if IS_POSTGRES:
-    app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-        'pool_pre_ping': True,
-        'pool_recycle': 280,
-        'pool_size': 5,
-        'max_overflow': 10,
-        'pool_timeout': 30,
-    }
-
-print(f"🗄️  Database: {'PostgreSQL (Production)' if IS_POSTGRES else 'SQLite (Local)'}")
-
 db = SQLAlchemy(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet' if IS_POSTGRES else 'threading')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # ═════════════════════════════════════════════
-# LIVE ONLINE TRACKING
+# LIVE ONLINE TRACKING (in-memory, real-time)
 # ═════════════════════════════════════════════
 
+# Maps sid -> {user_id, name, class, avatar_color, room, connected_at}
 active_sessions = {}
 
 
 def get_live_online_users():
+    """Get unique users currently connected via WebSocket."""
     seen = {}
     for sid, info in active_sessions.items():
         uid = info.get('user_id')
@@ -246,11 +207,8 @@ def get_current_user():
 
 def touch_user(user):
     if user:
-        try:
-            user.last_seen = datetime.utcnow()
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
+        user.last_seen = datetime.utcnow()
+        db.session.commit()
 
 
 def get_total_user_count():
@@ -356,10 +314,7 @@ def update_streak(user):
     else:
         user.streak = 1
     user.last_active = today
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    db.session.commit()
 
 
 def log_activity(user_id, delta):
@@ -371,10 +326,7 @@ def log_activity(user_id, delta):
         if delta > 0:
             log = ActivityLog(user_id=user_id, activity_date=today, circles_completed=delta)
             db.session.add(log)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    db.session.commit()
 
 
 def get_7day_data(user_id):
@@ -617,7 +569,12 @@ def bottom_nav_html(active):
     </nav>'''
 
 
+# ═════════════════════════════════════════════
+# GLOBAL PRESENCE SCRIPT (used on every page)
+# ═════════════════════════════════════════════
+
 def presence_script():
+    """Small script to connect WebSocket on every page for accurate presence."""
     return """
     <script>
       (function() {
@@ -636,7 +593,7 @@ def presence_script():
 
 
 # ═════════════════════════════════════════════
-# TEMPLATES
+# ONBOARDING TEMPLATE
 # ═════════════════════════════════════════════
 
 ONBOARDING_TEMPLATE = """
@@ -685,6 +642,10 @@ ONBOARDING_TEMPLATE = """
 </body></html>
 """
 
+
+# ═════════════════════════════════════════════
+# DASHBOARD TEMPLATE
+# ═════════════════════════════════════════════
 
 DASHBOARD_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
@@ -928,6 +889,10 @@ DASHBOARD_TEMPLATE = """
 </body></html>
 """
 
+
+# ═════════════════════════════════════════════
+# SUBJECT TEMPLATE
+# ═════════════════════════════════════════════
 
 SUBJECT_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
@@ -1181,6 +1146,10 @@ async function deleteSubject() {
 """
 
 
+# ═════════════════════════════════════════════
+# CHAT TEMPLATE (REAL-TIME WITH SOCKETIO)
+# ═════════════════════════════════════════════
+
 CHAT_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
 <title>Live Chat — StudyTracker</title>
@@ -1245,6 +1214,7 @@ function renderMessage(m, animate=true) {
   container.appendChild(bubbleWrap);
 
   const scroll = document.getElementById('chatScroll');
+  // remove empty state
   const empty = document.getElementById('emptyState');
   if (empty) empty.remove();
   scroll.appendChild(container);
@@ -1334,10 +1304,12 @@ function showTyping(userName) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  // Initial render
   const initial = {{ messages | tojson }};
   initial.forEach(m => renderMessage(m, false));
   scrollToBottom();
 
+  // Connect SocketIO
   updateStatus('connecting');
   socket = io({transports: ['websocket','polling']});
   
@@ -1474,6 +1446,10 @@ document.addEventListener('DOMContentLoaded', () => {
 </body></html>
 """
 
+
+# ═════════════════════════════════════════════
+# EXAM ZONE TEMPLATE
+# ═════════════════════════════════════════════
 
 EXAM_ZONE_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
@@ -1673,6 +1649,10 @@ function closeScheduleModal() { document.getElementById('scheduleModal').classLi
 """
 
 
+# ═════════════════════════════════════════════
+# ANALYTICS TEMPLATE
+# ═════════════════════════════════════════════
+
 ANALYTICS_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
 <title>Analytics — StudyTracker</title>
@@ -1800,6 +1780,10 @@ ANALYTICS_TEMPLATE = """
 </body></html>
 """
 
+
+# ═════════════════════════════════════════════
+# SETTINGS TEMPLATE
+# ═════════════════════════════════════════════
 
 SETTINGS_TEMPLATE = """
 <!DOCTYPE html><html lang="en"><head>
@@ -1969,16 +1953,8 @@ def setup():
                 last_active=date.today(), created_at=datetime.utcnow(),
                 last_seen=datetime.utcnow(), avatar_color=color)
     db.session.add(user)
-    try:
-        db.session.commit()
-    except Exception as e:
-        db.session.rollback()
-        return render_template_string(
-            ONBOARDING_TEMPLATE, error=f"Setup failed: {str(e)[:100]}",
-            online_count=get_live_online_count(), total_users=get_total_user_count()
-        )
+    db.session.commit()
     session['user_id'] = user.id
-    session.permanent = True
     return redirect(url_for('index'))
 
 
@@ -2039,11 +2015,7 @@ def add_subject():
         tag=(request.form.get('tag', '').strip() or 'CUSTOM')[:50]
     )
     db.session.add(cs)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        return redirect(url_for('index'))
+    db.session.commit()
     return redirect(url_for('subject_page', subject_name=cs.name))
 
 
@@ -2065,23 +2037,16 @@ def add_chapter():
             color_to=meta['color_to'], tag=meta['tag']
         )
         db.session.add(cs)
-        try:
-            db.session.flush()
-            for i, ch_name in enumerate(DEFAULT_CURRICULUM[subject_name]):
-                db.session.add(CustomChapter(subject_id=cs.id, name=ch_name, order_index=i))
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            return redirect(url_for('index'))
+        db.session.flush()
+        for i, ch_name in enumerate(DEFAULT_CURRICULUM[subject_name]):
+            db.session.add(CustomChapter(subject_id=cs.id, name=ch_name, order_index=i))
+        db.session.commit()
     if not cs:
         return redirect(url_for('index'))
     max_order = db.session.query(func.max(CustomChapter.order_index)).filter_by(subject_id=cs.id).scalar() or 0
     ch = CustomChapter(subject_id=cs.id, name=name[:200], order_index=max_order + 1)
     db.session.add(ch)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    db.session.commit()
     return redirect(url_for('subject_page', subject_name=cs.name))
 
 
@@ -2114,11 +2079,7 @@ def delete_chapter():
     remaining = [c for i, c in enumerate(chapters) if i != chapter_index]
     for new_idx, ch in enumerate(remaining):
         ch.order_index = new_idx
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': 'DB error'}), 500
+    db.session.commit()
     return jsonify({'success': True})
 
 
@@ -2139,11 +2100,7 @@ def delete_subject():
     ChapterProgress.query.filter_by(user_id=user.id, subject=cs.name).delete()
     CustomChapter.query.filter_by(subject_id=cs.id).delete()
     db.session.delete(cs)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': 'DB error'}), 500
+    db.session.commit()
     return jsonify({'success': True})
 
 
@@ -2186,11 +2143,7 @@ def update_progress():
             completed=completed
         ))
         if completed: delta = 1
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': 'DB error'}), 500
+    db.session.commit()
     if delta != 0:
         log_activity(user.id, delta)
     chapters = curriculum[subject]['chapters']
@@ -2246,10 +2199,7 @@ def add_exam():
         existing.exam_date = exam_dt
     else:
         db.session.add(ExamSchedule(user_id=user.id, subject=subject, exam_date=exam_dt))
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    db.session.commit()
     return redirect(url_for('exam_zone'))
 
 
@@ -2267,11 +2217,7 @@ def delete_exam():
     if not exam:
         return jsonify({'success': False, 'error': 'Not found'}), 404
     db.session.delete(exam)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': 'DB error'}), 500
+    db.session.commit()
     return jsonify({'success': True})
 
 
@@ -2369,12 +2315,8 @@ def settings():
         if name and student_class:
             user.name = name[:100]
             user.student_class = student_class[:50]
-            try:
-                db.session.commit()
-                msg = "Profile updated successfully!"
-            except Exception:
-                db.session.rollback()
-                msg = "Failed to update profile."
+            db.session.commit()
+            msg = "Profile updated successfully!"
     stats = compute_stats(user.id)
     member_since = user.created_at.strftime('%b %d, %Y') if user.created_at else 'Recently'
     customs = CustomSubject.query.filter_by(user_id=user.id).order_by(CustomSubject.created_at).all()
@@ -2403,10 +2345,7 @@ def update_avatar():
     color = request.form.get('color', '#00E1FD')[:20]
     if color in AVATAR_COLORS:
         user.avatar_color = color
-        try:
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
+        db.session.commit()
     return redirect(url_for('settings'))
 
 
@@ -2424,19 +2363,17 @@ def reset():
         CustomChapter.query.filter_by(subject_id=cs.id).delete()
         db.session.delete(cs)
     db.session.delete(user)
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    db.session.commit()
     session.clear()
     return redirect(url_for('onboarding'))
 
 
 # ═════════════════════════════════════════════
-# SOCKETIO REAL-TIME EVENTS (with app_context)
+# SOCKETIO REAL-TIME EVENTS
 # ═════════════════════════════════════════════
 
 def broadcast_presence():
+    """Broadcast current online users to everyone."""
     users = get_live_online_users()
     users_public = [{
         "name": u['name'],
@@ -2453,24 +2390,25 @@ def broadcast_presence():
 def on_connect():
     user_id = session.get('user_id')
     if not user_id:
+        return False  # reject anonymous
+    user = User.query.get(user_id)
+    if not user:
         return False
-    with app.app_context():
-        user = User.query.get(user_id)
-        if not user:
-            return False
-        active_sessions[request.sid] = {
-            'user_id': user.id,
-            'name': user.name,
-            'student_class': user.student_class,
-            'avatar_color': user.avatar_color or '#00E1FD',
-            'room': None,
-            'connected_at': datetime.utcnow()
-        }
-        try:
-            user.last_seen = datetime.utcnow()
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
+    # Register this connection
+    active_sessions[request.sid] = {
+        'user_id': user.id,
+        'name': user.name,
+        'student_class': user.student_class,
+        'avatar_color': user.avatar_color or '#00E1FD',
+        'room': None,
+        'connected_at': datetime.utcnow()
+    }
+    # Update DB last_seen
+    try:
+        user.last_seen = datetime.utcnow()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
     broadcast_presence()
 
 
@@ -2496,16 +2434,19 @@ def on_join_chat_room(data):
     if not any(r['id'] == room for r in CHAT_ROOMS):
         room = 'general'
     info = active_sessions[sid]
+    # Leave previous room
     if info.get('room') and info['room'] != room:
         leave_room(info['room'])
     join_room(room)
     info['room'] = room
     room_name = next((r['name'] for r in CHAT_ROOMS if r['id'] == room), room)
+    # Notify others in room
     emit('user_joined', {
         'user_id': info['user_id'],
         'name': info['name'],
         'room_name': room_name
     }, room=room, include_self=False)
+    # Send updated presence
     users = get_live_online_users()
     users_public = [{
         "name": u['name'],
@@ -2526,6 +2467,9 @@ def on_send_message(data):
     if not info:
         return
     user_id = info['user_id']
+    user = User.query.get(user_id)
+    if not user:
+        return
     room = data.get('room', info.get('room') or 'general')
     if not any(r['id'] == room for r in CHAT_ROOMS):
         return
@@ -2535,48 +2479,46 @@ def on_send_message(data):
     if len(message) > 1000:
         message = message[:1000]
     reply_to_id = data.get('reply_to_id')
-    
-    with app.app_context():
-        user = User.query.get(user_id)
-        if not user:
-            return
-        reply_to = None
-        if reply_to_id:
-            try:
-                reply_to = int(reply_to_id)
-                parent = ChatMessage.query.get(reply_to)
-                if not parent or parent.room != room:
-                    reply_to = None
-            except (TypeError, ValueError):
-                reply_to = None
-        msg = ChatMessage(
-            user_id=user.id, user_name=user.name,
-            user_class=user.student_class,
-            user_avatar_color=user.avatar_color or '#00E1FD',
-            room=room, message=message, reply_to_id=reply_to
-        )
-        db.session.add(msg)
+    reply_to = None
+    if reply_to_id:
         try:
-            user.last_seen = datetime.utcnow()
-            db.session.commit()
-        except Exception:
-            db.session.rollback()
-            return
-        payload = {
-            "id": msg.id, "user_id": msg.user_id, "user_name": msg.user_name,
-            "user_class": msg.user_class,
-            "user_avatar_color": msg.user_avatar_color,
-            "message": msg.message, "time_ago": "just now",
-            "room": msg.room, "reply_to": None
-        }
-        if reply_to:
+            reply_to = int(reply_to_id)
             parent = ChatMessage.query.get(reply_to)
-            if parent:
-                payload["reply_to"] = {
-                    "id": parent.id,
-                    "user_name": parent.user_name,
-                    "message": parent.message
-                }
+            if not parent or parent.room != room:
+                reply_to = None
+        except (TypeError, ValueError):
+            reply_to = None
+    # Save to DB
+    msg = ChatMessage(
+        user_id=user.id, user_name=user.name,
+        user_class=user.student_class,
+        user_avatar_color=user.avatar_color or '#00E1FD',
+        room=room, message=message, reply_to_id=reply_to
+    )
+    db.session.add(msg)
+    try:
+        user.last_seen = datetime.utcnow()
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return
+    # Build payload
+    payload = {
+        "id": msg.id, "user_id": msg.user_id, "user_name": msg.user_name,
+        "user_class": msg.user_class,
+        "user_avatar_color": msg.user_avatar_color,
+        "message": msg.message, "time_ago": "just now",
+        "room": msg.room, "reply_to": None
+    }
+    if reply_to:
+        parent = ChatMessage.query.get(reply_to)
+        if parent:
+            payload["reply_to"] = {
+                "id": parent.id,
+                "user_name": parent.user_name,
+                "message": parent.message
+            }
+    # Broadcast to everyone in the room
     socketio.emit('new_message', payload, room=room)
 
 
@@ -2595,96 +2537,51 @@ def on_typing(data):
 
 
 # ═════════════════════════════════════════════
-# DB INIT + AUTO MIGRATION (Works on SQLite + PostgreSQL)
+# DB INIT + AUTO MIGRATION
 # ═════════════════════════════════════════════
 
 def init_db():
-    """Safe DB initialization — never destroys data, works on both DBs."""
     with app.app_context():
-        try:
-            db.create_all()
-            print("✅ Database tables ensured")
-        except Exception as e:
-            print(f"⚠️  create_all warning: {e}")
-
+        db.create_all()
         from sqlalchemy import inspect, text
-        try:
-            inspector = inspect(db.engine)
-            existing_tables = inspector.get_table_names()
-        except Exception as e:
-            print(f"⚠️  Could not inspect DB: {e}")
-            return
-
-        if 'user' not in existing_tables:
-            print("ℹ️  Fresh database — no migrations needed")
-            return
-
-        try:
-            existing_cols = [c['name'] for c in inspector.get_columns('user')]
-        except Exception as e:
-            print(f"⚠️  Could not read columns: {e}")
-            return
-
-        needed = {
-            'created_at':   'TIMESTAMP',
-            'last_active':  'DATE',
-            'last_seen':    'TIMESTAMP',
-            'streak':       'INTEGER DEFAULT 0',
-            'avatar_color': "VARCHAR(20) DEFAULT '#00E1FD'"
-        }
-
-        migrations = []
-        for col_name, col_type in needed.items():
-            if col_name not in existing_cols:
-                # Quote 'user' table name (reserved word in PostgreSQL)
-                table_ref = '"user"' if IS_POSTGRES else 'user'
-                migrations.append((col_name, f"ALTER TABLE {table_ref} ADD COLUMN {col_name} {col_type}"))
-
-        if not migrations:
-            print("✅ Schema up-to-date")
-            return
-
-        print(f"🔧 Running {len(migrations)} migration(s)...")
-        for col_name, stmt in migrations:
-            try:
-                with db.engine.begin() as conn:
-                    conn.execute(text(stmt))
-                print(f"   ✅ Added column: {col_name}")
-            except Exception as e:
-                print(f"   ⚠️  Skipped {col_name}: {e}")
-
-        try:
-            table_ref = '"user"' if IS_POSTGRES else 'user'
-            with db.engine.begin() as conn:
-                if IS_POSTGRES:
-                    conn.execute(text(f"UPDATE {table_ref} SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
-                    conn.execute(text(f"UPDATE {table_ref} SET last_active = CURRENT_DATE WHERE last_active IS NULL"))
-                    conn.execute(text(f"UPDATE {table_ref} SET last_seen = CURRENT_TIMESTAMP WHERE last_seen IS NULL"))
-                else:
-                    conn.execute(text(f"UPDATE {table_ref} SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
-                    conn.execute(text(f"UPDATE {table_ref} SET last_active = DATE('now') WHERE last_active IS NULL"))
-                    conn.execute(text(f"UPDATE {table_ref} SET last_seen = CURRENT_TIMESTAMP WHERE last_seen IS NULL"))
-                conn.execute(text(f"UPDATE {table_ref} SET streak = 0 WHERE streak IS NULL"))
-                conn.execute(text(f"UPDATE {table_ref} SET avatar_color = '#00E1FD' WHERE avatar_color IS NULL"))
-            print("✅ Backfill complete")
-        except Exception as e:
-            print(f"⚠️  Backfill warning: {e}")
-
-
-# Initialize DB immediately when this module is imported (needed for Gunicorn on Render)
-init_db()
+        inspector = inspect(db.engine)
+        if 'user' in inspector.get_table_names():
+            existing = [c['name'] for c in inspector.get_columns('user')]
+            migrations = []
+            if 'created_at' not in existing:
+                migrations.append("ALTER TABLE user ADD COLUMN created_at DATETIME")
+            if 'last_active' not in existing:
+                migrations.append("ALTER TABLE user ADD COLUMN last_active DATE")
+            if 'streak' not in existing:
+                migrations.append("ALTER TABLE user ADD COLUMN streak INTEGER DEFAULT 0")
+            if 'last_seen' not in existing:
+                migrations.append("ALTER TABLE user ADD COLUMN last_seen DATETIME")
+            if 'avatar_color' not in existing:
+                migrations.append("ALTER TABLE user ADD COLUMN avatar_color VARCHAR(20) DEFAULT '#00E1FD'")
+            if migrations:
+                print(f"🔧 Migrating 'user' table ({len(migrations)} change(s))...")
+                with db.engine.connect() as conn:
+                    for stmt in migrations:
+                        try:
+                            conn.execute(text(stmt))
+                            conn.commit()
+                            print(f"   ✅ {stmt}")
+                        except Exception as e:
+                            print(f"   ⚠️  Skipped: {stmt} → {e}")
+                    try:
+                        conn.execute(text("UPDATE user SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
+                        conn.execute(text("UPDATE user SET last_active = DATE('now') WHERE last_active IS NULL"))
+                        conn.execute(text("UPDATE user SET streak = 0 WHERE streak IS NULL"))
+                        conn.execute(text("UPDATE user SET last_seen = CURRENT_TIMESTAMP WHERE last_seen IS NULL"))
+                        conn.execute(text("UPDATE user SET avatar_color = '#00E1FD' WHERE avatar_color IS NULL"))
+                        conn.commit()
+                    except Exception as e:
+                        print(f"   ⚠️  Backfill: {e}")
+                print("✅ Migrations complete.\n")
 
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    debug_mode = not IS_POSTGRES
-    print(f"🚀 StudyTracker running on http://0.0.0.0:{port}")
-    print(f"💡 Real-time chat enabled (async_mode: {'eventlet' if IS_POSTGRES else 'threading'})")
-    socketio.run(
-        app,
-        host='0.0.0.0',
-        port=port,
-        debug=debug_mode,
-        allow_unsafe_werkzeug=True,
-        use_reloader=False
-    )
+    init_db()
+    print("🚀 StudyTracker (Real-Time) running at: http://127.0.0.1:5000")
+    print("💡 WebSocket-based chat & live presence enabled")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
